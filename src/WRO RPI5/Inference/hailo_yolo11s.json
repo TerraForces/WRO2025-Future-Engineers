@@ -1,0 +1,18 @@
+{
+    "rpicam-apps":
+    {
+        "lores":
+        {
+            "width": 640,
+            "height": 640,
+            "format": "rgb"
+        }
+    },
+
+    "hailo_yolo_inference":
+    {
+        "hef_file": "/home/terra/Documents/WRO RPI5/yolov11s_hailo8.hef",
+        "max_detections": 10,
+        "threshold": 0.5
+    }
+}

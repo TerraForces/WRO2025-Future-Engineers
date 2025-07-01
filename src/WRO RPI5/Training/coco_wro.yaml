@@ -1,0 +1,8 @@
+path: /home/terra/datasets/WRO 2025/YOLO/
+train: images/train2017
+val: images/val2017
+
+names:
+  0: red
+  1: green
+  2: pink

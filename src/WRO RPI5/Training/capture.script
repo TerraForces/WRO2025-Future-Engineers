@@ -1,0 +1,8 @@
+#!/bin/bash
+declare -i i=1997
+while :
+do
+j=$(printf "%04d" $i)
+rpicam-jpeg --width 640 --height 640 -o /home/terra/Pictures/$j.jpg --hflip --vflip -t 2000
+((i++))
+done
