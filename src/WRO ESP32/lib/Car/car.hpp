@@ -7,8 +7,8 @@
 #pragma GCC optimize("-Ofast")
 
 // prevent including multiple times
-#ifndef CAR_H
-#define CAR_H
+#ifndef CAR_HPP
+#define CAR_HPP
 
 // include basic types and arduino framework functions
 #include <Arduino.h>

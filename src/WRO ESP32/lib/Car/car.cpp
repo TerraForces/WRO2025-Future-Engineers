@@ -9,11 +9,9 @@
 // include header file
 #include "car.hpp"
 
-// include library for the st7735 lcd controller
+// include library for the st7735 lcd controller with modified SPI
+#include <SPI2.hpp>
 #include <Adafruit_ST7735.h>
-
-// include library for the ds18b20 temperature sensor
-#include <DallasTemperature.h>
 
 // include ledc channel control driver
 #include <driver/ledc.h>
@@ -31,20 +29,23 @@ extern "C" {
     #include <inv_mpu_dmp_motion_driver.h>
 }
 
+// include modified OneWire library for communication with the ds18b20 temperature sensor
+#include <OneWire.hpp>
+
 // include for vector support
 #include <vector>
 
 // undefine MPU9250 macro to use it as class name
 #undef MPU9250
 
-// macro for optional error logging
+// macro for error handling (currently only optional error logging)
 #define SNIPE(condition) if(condition) { log_e("sniped"); }
 
 // pin configuration
 constexpr uint8_t Pin_ST7735_LED             = 0;  // output - lcd background led control over pwm
 constexpr uint8_t Pin_MPU9250_Data_Ready     = 2;  // input  - interrupt when mpu9250 fifo receives new data
-constexpr uint8_t Pin_ST7735_DC              = 4;  // output - 
-constexpr uint8_t Pin_ST7735_RST             = 5;
+constexpr uint8_t Pin_ST7735_DC              = 4;  // output - lcd data/command
+constexpr uint8_t Pin_ST7735_RST             = 5;  // output - lcd reset
 constexpr uint8_t Pin_ST7735_CS              = 12; // output - lcd spi chip select
 constexpr uint8_t Pin_ST7735_MOSI            = 13; // output - lcd spi data out
 constexpr uint8_t Pin_ST7735_SCK             = 14; // output - lcd spi serial clock
@@ -59,20 +60,21 @@ constexpr uint8_t Pin_DS18B20_OneWire        = 27; // in/out - OneWire bus for c
 constexpr uint8_t Pin_I2C_1_SDA			     = 32; // in/out - i2c bus 1 data (bidirectional)
 constexpr uint8_t Pin_I2C_1_SCL			     = 33; // output - i2c bus 1 serial clock
 constexpr uint8_t Pin_Battery_Voltage		 = 34; // input  - battery voltage after voltage divider (10V battery voltage = 3.3V voltage at pin)
-constexpr uint8_t Pin_Total_Current		     = 35; // input  - total current measured over 0.25 ohms resistor and multiplied by 20
-constexpr uint8_t Pin_Motor_Current		     = 36; // input  - total current measured over 0.33 ohms resistor and multiplied by 20
+constexpr uint8_t Pin_Total_Current		     = 35; // input  - total current measured as voltage over 0.25 ohms resistor and multiplied by 20
+constexpr uint8_t Pin_Motor_Current		     = 36; // input  - total current measured as voltage over 0.33 ohms resistor and multiplied by 20
 constexpr uint8_t Pin_Start_Button           = 39; // input  - start button (externally pulled up)
 
 // motor pwm configuration
 constexpr uint16_t Motor_PWM_Min_Frequency   = 8000;  // minimal pwm frequency used for motor pwm
 constexpr uint16_t Motor_PWM_Max_Frequency   = 12000; // maximum pwm frequency used for motor pwm
-constexpr float Motor_PWM_Time_To_Max        = 2.0f;  // time in seconds for the motor pwm to reach 1.0f or -1.0f from 0.0f
-constexpr float Motor_PWM_Time_To_Null       = 0.5f;  // time in seconds for the motor pwm to reach 0.0f from 1.0f or -1.0f
+constexpr float Motor_PWM_Time_To_Max        = 2.00f; // time in seconds for the motor pwm to reach 1.0f or -1.0f from 0.0f
+constexpr float Motor_PWM_Time_To_Null       = 0.50f; // time in seconds for the motor pwm to reach 0.0f from 1.0f or -1.0f
 constexpr float Motor_PWM_Update_Interval    = 0.05f; // motor pwm update interval in seconds
 
 // servo pwm configuration
 constexpr uint16_t Servo_PWM_0_Duty          = 7940;  // servo pwm duty in 0° position (might be adjusted after hardware changes)
-constexpr float Servo_PWM_Time_To_Max        = 0.5f;  /////////////////////////////////////////////////////////////////////////////////////////////////////////////// TODO
+constexpr float Servo_PWM_Max_Angle          = 80.0f; // max angle in both directions
+constexpr float Servo_PWM_Time_To_Max        = 0.40f; // time in seconds to reach max angle from 0.0f or to reach 0.0f from max angle
 constexpr float Servo_PWM_Update_Interval	 = 0.05f; // servo pwm update interval in seconds
 
 // lcd configuration
@@ -81,7 +83,7 @@ constexpr float Battery_Voltage_Warning      = 7.0f;  // battery voltage less th
 constexpr float Battery_Voltage_Empty        = 6.6f;  // battery voltage less than this value is shown red on lcd
 
 // handles of background tasks
-TaskHandle_t motorAccelerationThread, servoAccelerationThread, i2cThread0, i2cThread1;
+TaskHandle_t motorAccelerationThread, i2cThread0, i2cThread1;
 
 // data transport between background tasks and main
 volatile float lastRotation[3] = {};
@@ -90,13 +92,12 @@ volatile int16_t rounds[3] = {};
 volatile uint16_t distances[4] = {};
 volatile uint8_t ledState = 0x00;
 volatile int32_t motorTargetDuty = 0;
-volatile int32_t servoTargetDuty = Servo_PWM_0_Duty;
 volatile uint64_t taskFlowFailures[4] = {};
 
-Adafruit_ST7735 st7735(Pin_ST7735_CS, Pin_ST7735_DC, Pin_ST7735_MOSI, Pin_ST7735_SCK, Pin_ST7735_RST);
+SPIClass hspi(HSPI);
+Adafruit_ST7735 st7735(&hspi, Pin_ST7735_CS, Pin_ST7735_DC, Pin_ST7735_RST);
 OneWire oneWire = OneWire(Pin_DS18B20_OneWire);
-DallasTemperature ds18b20 = DallasTemperature(&oneWire);
-DeviceAddress ds18b20Address = {};
+uint8_t ds18b20Address[8] = {};
 std::vector<CAR::OBJECT> detections = { CAR::OBJECT {0, 0, 0, 0, 0, 0 } }, currentDetections;
 SemaphoreHandle_t uartMutexLock = 0;
 uart_t* uart = 0;
@@ -115,7 +116,7 @@ constexpr uint8_t vl53l1xConfiguration[91] = {
     0x00, 0x02, 0xc7, 0xff, 0x9B, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x00
 };
-volatile uint8_t vl53l1xViewCenters[4] = { 63, 62, 62, 60 };
+volatile uint8_t vl53l1xViewCenters[4] = { 199, 199, 63, 62 };
 volatile uint8_t lastVl53l1xViewCenters[4] = {};
 
 uint8_t vl53l1xReadByte(uint8_t add, uint16_t reg) {
@@ -276,21 +277,6 @@ void motor_control_task(void* unused) {
 	}
 }
 
-void servo_control_task(void* unused) {
-	TickType_t lastWakeTime = xTaskGetTickCount();
-    constexpr TickType_t updateInterval = (1000 * Servo_PWM_Update_Interval) + 0.5;
-	int32_t currentServoDuty = Servo_PWM_0_Duty;
-    constexpr int32_t servoMaxDuty = 1 << LEDC_TIMER_14_BIT;
-	constexpr int32_t servoChangeRate = (servoMaxDuty * Servo_PWM_Update_Interval / Servo_PWM_Time_To_Max) + 0.5;
-	while(true) {
-		if(!xTaskDelayUntil(&lastWakeTime, updateInterval)) taskFlowFailures[3]++;
-		if(servoTargetDuty > currentServoDuty) currentServoDuty = _min(servoTargetDuty, currentServoDuty + servoChangeRate);
-		if(servoTargetDuty < currentServoDuty) currentServoDuty = _max(servoTargetDuty, currentServoDuty - servoChangeRate);
-		SNIPE(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, currentServoDuty));
-		SNIPE(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
-	}
-}
-
 void uart_task(void* unused) {
     uart_event_t event;
     QueueHandle_t uartEventQueue = 0;
@@ -404,15 +390,15 @@ void CAR::LCD::setBrightness(float brightness) {
 }
 
 void CAR::LCD::showBatteryVoltage() {
+    st7735.fillScreen(0x0000);
     float voltage = supervision.getVoltage();
     st7735.setTextColor(voltage < Battery_Voltage_Empty ? 0xF800 : (voltage < Battery_Voltage_Warning ? 0xFFE0 : 0x07E0), 0x0000);
-    st7735.setCursor(48, 4);
+    st7735.setCursor(50, 4);
     st7735.print(voltage, 2);
     st7735.print(" V ");
 }
 
 void CAR::LCD::showDistanceCalibration(uint8_t i) {
-    st7735.fillScreen(0x0000);
     showBatteryVoltage();
     st7735.setTextColor(0xFFFF);
     st7735.drawLine(i < 2 ? 4 : 11, (i < 2 ? 31 : 24), i < 2 ? 18 : 11, (i < 2 ? 31 : 38), 0xFFFF);
@@ -467,7 +453,6 @@ void CAR::LCD::showDistanceCalibration(uint8_t i) {
 
 void CAR::LCD::showDistances() {
     showBatteryVoltage();
-    st7735.fillRect(3, 24, 110, 100, 0x0000);
     st7735.setTextColor(0xFFFF);
     for(uint8_t i = 0; i < 4; i++) {
         st7735.drawLine(i < 2 ? 4 : 11, (i < 2 ? 31 : 24) + (i * 20), i < 2 ? 18 : 11, (i < 2 ? 31 : 38) + (i * 20), 0xFFFF);
@@ -486,7 +471,6 @@ void CAR::LCD::showFinish(uint32_t duration) {
     st7735.setCursor(4, 40);
     st7735.print("Race finished");
     st7735.setTextColor(0xFFFF, 0x0000);
-    st7735.fillRect(3, 24, 125, 120, 0x0000);
     st7735.setCursor(4, 70);
     st7735.print("Time:");
     st7735.setCursor(4, 90);
@@ -502,7 +486,6 @@ void CAR::LCD::showFinish(uint32_t duration) {
 void CAR::LCD::showObjects() {
     std::vector<CAR::OBJECT> objectBuf = detections;
     showBatteryVoltage();
-    st7735.fillRect(0, 22, 128, 138, 0x0000);
     for(uint16_t i = 1; i <= objectBuf.size(); i++) {
         uint16_t j = objectBuf.size() - i;
         st7735.fillRect(10 + (objectBuf[j].l / 12u), 32 + (objectBuf[j].t / 12u), objectBuf[j].w / 12u, objectBuf[j].h / 12u, objectColors[objectBuf[j].c]);
@@ -532,7 +515,6 @@ void CAR::LCD::showReady(uint32_t duration) {
 
 void CAR::LCD::showRotation() {
     showBatteryVoltage();
-    st7735.fillRect(3, 24, 110, 100, 0x0000);
     st7735.setTextColor(0xFFFF, 0x0000);
     MPU9250::FLOAT3 rotation = mpu9250.getRotation();
     for(uint8_t i = 0; i < 3; i++) {
@@ -545,7 +527,6 @@ void CAR::LCD::showRotation() {
 
 void CAR::LCD::showString(String str) {
     showBatteryVoltage();
-    st7735.fillRect(0, 22, 128, 138, 0x0000);
     st7735.setTextColor(0xFFFF);
     st7735.setCursor(4, 40);
     st7735.print(str);
@@ -553,7 +534,6 @@ void CAR::LCD::showString(String str) {
 
 void CAR::LCD::showSupervision() {
     showBatteryVoltage();
-    st7735.fillRect(3, 24, 100, 100, 0x0000);
     for(uint8_t i = 0; i < 3; i++) {
         float data = 0.0f;
         if(i == 0) {
@@ -708,11 +688,11 @@ CAR::SERVO::SERVO() {
         .clk_cfg          = LEDC_AUTO_CLK
     };
 	SNIPE(ledc_timer_config(&ledcTimerConfig));
-    SNIPE(xTaskCreatePinnedToCore(servo_control_task, "Servo Acceleration", 5000, 0, 2, &servoAccelerationThread, 1 - xPortGetCoreID()));
 }
 
 void CAR::SERVO::setAngle(float angle) {
-    servoTargetDuty = Servo_PWM_0_Duty + (constrain(angle, -80.0, 80.0) * 70);
+    SNIPE(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, Servo_PWM_0_Duty + (constrain(angle, -Servo_PWM_Max_Angle, Servo_PWM_Max_Angle) * 70)));
+	SNIPE(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
 }
 
 CAR::SERVO CAR::servo;
@@ -721,8 +701,7 @@ CAR::VCT_SUPERVISION::VCT_SUPERVISION() {
     pinMode(Pin_Battery_Voltage, INPUT);
     pinMode(Pin_Total_Current, INPUT);
     pinMode(Pin_Motor_Current, INPUT);
-    ds18b20.begin();
-    ds18b20.getAddress(ds18b20Address, 0);
+	oneWire.search(ds18b20Address);
 }
 
 float CAR::VCT_SUPERVISION::getCoreTemp() {
@@ -730,8 +709,18 @@ float CAR::VCT_SUPERVISION::getCoreTemp() {
 }
 
 float CAR::VCT_SUPERVISION::getMosfetTemp() {
-    ds18b20.requestTemperaturesByAddress(ds18b20Address);
-    return ds18b20.getTempC(ds18b20Address);
+	oneWire.reset();
+	oneWire.select(ds18b20Address);
+	oneWire.write_byte(0x44);
+    uint64_t waitStart = esp_timer_get_time();
+    while ((oneWire.read_bit() != 1) && (esp_timer_get_time() < (waitStart + 750000)));
+    oneWire.reset();
+    oneWire.select(ds18b20Address);
+	oneWire.write_byte(0xBE);
+    uint8_t buf[9];
+    for (uint8_t i = 0; i < 9; i++) buf[i] = oneWire.read_byte();
+    oneWire.reset();
+    return ((((int16_t)buf[1]) << 11) | (((int16_t)buf[0]) << 3) | (0xFFF80000 * (buf[1] & 0x80))) * 0.0078125f;
 }
 
 float CAR::VCT_SUPERVISION::getMotorCurrent() {
