@@ -9,27 +9,28 @@
 
 // possible object colors
 enum COLORS : uint8_t {
-    CLEAR,
-    RED,
-    GREEN,
-    PINK
+    CLEAR, // sent as first object in each transmission, clears object buffer
+    RED,   // red traffic sign
+    GREEN, // green traffic sign
+    PINK   // pink parking space borders
 };
 
 // description of detected objects
 struct OBJECT {
-    uint16_t l; // left x position in image pixels (0 - 1295)
-    uint16_t r; // right x position in image pixels (0 - 1295)
-    uint16_t t; // top y position in image pixels (0 - 1295)
-    uint16_t b; // bottom y position in image pixels (0 - 1295)
-    uint16_t w; // object width in image pixels (0 - 1295)
-    uint16_t h; // object height in image pixels (0 - 1295)
-    uint16_t c; // object color
-    uint16_t p; // detection probability in 0.1%  (0 - 1000)
+    uint16_t l; // left x position of the bounding rect in image pixels (0 - 1295)
+    uint16_t r; // right x position of the bounding rect in image pixels (0 - 1295)
+    uint16_t t; // top y position of the bounding rect in image pixels (0 - 1295)
+    uint16_t b; // bottom y position of the bounding rect in image pixels (0 - 1295)
+    uint16_t w; // bounding rect width in image pixels (0 - 1295)
+    uint16_t h; // bounding rect height in image pixels (0 - 1295)
+    uint16_t c; // object color (see possible object colors above)
+    uint16_t p; // detection probability in 0.1% (0 - 1000)
 };
 
-int main(void) {
+// program start
+int main() {
 
-    // start UART at 115200 baud
+    // start UART bus at 115200 bits per second
     int32_t uart = open("/dev/ttyAMA0", O_RDWR);
     termios tty;
     tcgetattr(uart, &tty);
@@ -54,8 +55,8 @@ int main(void) {
     cfsetospeed(&tty, B115200);
     tcsetattr(uart, TCSANOW, &tty);
 
-    // start camera + inference pipeline and capture output
-    ipstream pipe("rpicam-hello --framerate 40 --hflip --vflip --post-process-file /home/terra/Documents/WRO\\ RPI5/hailo_yolo11s.json -t 0 -v -n -q 100 --width 1296 --height 1296", pstreams::pstderr);
+    // start camera + inference pipeline and capture output (command is using error output for logging)
+    ipstream pipe("rpicam-hello --framerate 50 --hflip --vflip --post-process-file /home/terra/Documents/WRO\\ RPI5/hailo_yolo11s.json -n -t 0 -v --width 1296 --height 1296", pstreams::pstderr);
     
     // read output lines and extract important data
     std::string line;

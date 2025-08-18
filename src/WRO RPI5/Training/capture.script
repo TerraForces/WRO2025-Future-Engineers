@@ -1,5 +1,5 @@
 #!/bin/bash
-declare -i i=1997
+declare -i i=3000
 while :
 do
 j=$(printf "%04d" $i)

@@ -9,5 +9,6 @@
         "unordered_map": "cpp",
         "vector": "cpp",
         "initializer_list": "cpp"
-    }
+    },
+    "cmake.ignoreCMakeListsMissing": true
 }

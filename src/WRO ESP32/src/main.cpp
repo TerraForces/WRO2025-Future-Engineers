@@ -6,14 +6,19 @@
 // optimize program for higher execution speed
 #pragma GCC optimize("-Ofast")
 
-#define OBJECT_DETECTION
+// program selection definations
+//#define OBJECT_DETECTION
 //#define TEST
 
+// include car.hpp for sensor and control functions
 #include "car.hpp"
+
+// automatically use namespace CAR in this document
 using namespace CAR;
 
 #ifdef TEST
-#pragma region speed test
+// test mode for distance sensor calibration or object detection test
+#pragma region test mode
 
 void setup() {
 
@@ -30,7 +35,7 @@ void setup() {
 
 #endif
 
-	// show ready screen
+	// show ready screen with time since boot
 	lcd.showReady(esp_timer_get_time());
 
 	// wait for button press
@@ -41,24 +46,24 @@ void loop() {
 
 #ifdef OBJECT_DETECTION
 
-	// show objects periodically
+	// update screen periodically with objects (every 500 ms)
 	static TickType_t lastTicks = xTaskGetTickCount();
 	lcd.showObjects();
-	xTaskDelayUntil(&lastTicks, 2000);
+	xTaskDelayUntil(&lastTicks, 500);
 
 #else
 
-	// show calibration interface for each ToF sensor
+	// show uncalibrated distances
+	lcd.showDistances();
+	vTaskDelay(200);
+	button.wait();
+
+	// show calibration interface for each of the 4 ToF sensors
 	for(uint8_t i = 0; i < 4; i++) {
 		lcd.showDistanceCalibration(i);
 		vTaskDelay(200);
 		button.wait();
 	}
-
-	// show calibrated distances
-	lcd.showDistances();
-	vTaskDelay(200);
-	button.wait();
 	
 	// show other sensor data
 	lcd.showRotation();
@@ -75,16 +80,20 @@ void loop() {
 #else
 
 #ifndef OBJECT_DETECTION
+// first challenge without objects but with variable width of the inner border
 #pragma region without objects
 
-constexpr float SPEED_START  = 1.0f;
-constexpr float SPEED_NORMAL = 1.0f;
-constexpr float SPEED_HIGH   = 1.0f;
+// driving speed selection (recommended 0.2f - 1.0f)
+constexpr float SPEED_START  = 1.0f; // speed while looking for the first corner
+constexpr float SPEED_NORMAL = 1.0f; // speed while close to next turn or border
+constexpr float SPEED_HIGH   = 1.0f; // speed while driving on optimal track
 
-bool outsideBorder = 0;
-float targetRotation = 0.0f, rotationOffset = 0.0f;
-int64_t startTime = 0, lastCurve = 0;
-uint32_t intervalTimer = 0;
+// global working variables
+bool outsideBorder = 0;      // outside border relative to vehicle driving direction (0 = left; 1 = right)
+float targetRotation = 0.0f; // target driving rotation for direction correction relative to starting position (in °)
+float rotationOffset = 0.0f; // rotation offset at starting position
+int64_t startTime = 0;       // driving start time in microseconds from boot
+int64_t lastCurve = 0;       // last curve end time in microseconds from boot
 
 void setup() {
 
@@ -94,7 +103,7 @@ void setup() {
 	// start ToF sensors
 	vl53l1x.init();
 
-	// show ready screen
+	// show ready screen with time since boot
 	lcd.showReady(esp_timer_get_time());
 
 	// wait for button press
@@ -103,111 +112,139 @@ void setup() {
 	// capture start time
 	startTime = esp_timer_get_time();
 
+	// set rotation offset to current rotation
+	rotationOffset = mpu9250.getRotation().z;
+
 	// start driving forward
 	motor.setSpeed(SPEED_START);
 
-	// wait until open space is detected
-	bool borderLeft = 1, borderRight = 1;
+	// wait until open space on one side is detected
+	// or skip this step if one border is really close (indicating a start inside of a narrowed section)
+	bool borderLeft = vl53l1x.getDistance(LEFT) > 100;
+	bool borderRight = vl53l1x.getDistance(RIGHT) > 100;
 	while(borderLeft && borderRight) {
-		borderLeft = vl53l1x.getDistance(LEFT) < 1500;
-		borderRight = vl53l1x.getDistance(RIGHT) < 1500;
+		borderLeft = vl53l1x.getDistance(LEFT) < 1000;
+		borderRight = vl53l1x.getDistance(RIGHT) < 1000;
 		vTaskDelay(1);
 	}
+
+	// set outside border to the side where no open space or close border was detected
 	outsideBorder = borderRight;
 
 	// increase driving speed
 	motor.setSpeed(SPEED_NORMAL);
-
-	// set current time for loop interval control
-	intervalTimer = xTaskGetTickCount();
 }
 
 void loop() {
 
-	// get current rotation
-	MPU9250::FLOAT3 rotation = mpu9250.getRotation();
-	rotation.z += rotationOffset;
+	// get current rotation and subtract offset
+	float rotation = mpu9250.getRotation().z - rotationOffset;
 
 	// get current distance measurements
+	// (excluding back/rear distance - needed only once - no storage required)
 	uint16_t distances[3] = {};
 	for(uint8_t i = 0; i < 3; i++) distances[i] = vl53l1x.getDistance(i);
 
-	// end condition
+	// end condition: stop after 3 rounds = 1080°
+	// and sufficient distance on the rear sensor to stop inside of the section
+	// (cooldown after last curve needed because of sensor latency)
 	if ((abs(targetRotation) >= 1080.0f) && (vl53l1x.getDistance(BACK) > 1000) && (esp_timer_get_time() > (lastCurve + 500000))) {
+
+		// stop driving
 		motor.setSpeed(0.0f);
 
-		// repeat until v=0
+		// repeat until really stopped
 		while(supervision.getMotorCurrent() > 0) {
 
-			// get current rotation
-			MPU9250::FLOAT3 rotation = mpu9250.getRotation();
-			rotation.z += rotationOffset;
+			// get current rotation and subtract offset
+			rotation = mpu9250.getRotation().z - rotationOffset;
 
-			// get current distance measurements
-			uint16_t distances[3] = {};
-			for(uint8_t i = 0; i < 3; i++) distances[i] = vl53l1x.getDistance(i);
-
-			// border correction
-			if ((distances[LEFT] < 150) && (distances[FRONT] > 900)) {
+			// drive away from borders when getting too close
+			if (vl53l1x.getDistance(LEFT) < 150) {
 				servo.setAngle(6.0f);
 				vTaskDelay(200);
 			}
-			else if ((distances[RIGHT] < 150) && (distances[FRONT] > 900)) {
+			else if (vl53l1x.getDistance(RIGHT) < 150) {
 				servo.setAngle(-6.0f);
 				vTaskDelay(200);
 			}
 
-			// gyro correction
-			else if ((targetRotation - rotation.z) < -2.0f) servo.setAngle(max(targetRotation - rotation.z + 2.0f, -7.0f));
-			else if ((targetRotation - rotation.z) >  2.0f) servo.setAngle(min(targetRotation - rotation.z - 2.0f,  7.0f));
-			vTaskDelay(10);
+			// rotation correction (rotate towards target rotation when not driving away from borders)
+			else if ((targetRotation - rotation) < -2.0f) servo.setAngle(max(targetRotation - rotation + 2.0f, -7.0f));
+			else if ((targetRotation - rotation) >  2.0f) servo.setAngle(min(targetRotation - rotation - 2.0f,  7.0f));
 		}
 
-		// show finish screen and wait for shutdown
+		// show finish screen with driving time
 		lcd.showFinish(esp_timer_get_time() - startTime);
+
+		// wait indefinitely until shut down or restarted (by power or enable button)
 		while(true) vTaskDelay(10000000);
 	}
 
-	// increase driving speed when possible
-	if(SPEED_NORMAL != SPEED_HIGH) {
-		if ((distances[FRONT] > 1000) && (distances[LEFT] > 160) && (distances[RIGHT] > 160) && (abs(targetRotation - rotation.z) < 4.0f)) motor.setSpeed(SPEED_HIGH);
+	// only perform calculations if driving speed increase possible
+	if(SPEED_NORMAL < SPEED_HIGH) {
+
+		// increase driving speed when driving on optimal track, far away from curves or borders
+		if ((distances[FRONT] > 1000) && (distances[LEFT] > 160) && (distances[RIGHT] > 160) && (abs(targetRotation - rotation) < 4.0f)) motor.setSpeed(SPEED_HIGH);
+
+		// drive slower when not on optimal track or close to border or next curve
 		else motor.setSpeed(SPEED_NORMAL);
 	}
 
-	// curve mode
-	if (((((distances[LEFT] > 1100) || (distances[RIGHT] > 1100)) && (distances[FRONT] < 1100)) || (distances[FRONT] < 550)) && (esp_timer_get_time() > (lastCurve + 750000))) {
+	// curve mode - activated min. 750 ms after last curve (because of sensor latency)
+	// starting when wide space at one side detected and front distance < 1.2 m
+	// or when front distance < 650 mm
+	if (((((distances[LEFT] > 1000) || (distances[RIGHT] > 1000)) && (distances[FRONT] < 1200)) || (distances[FRONT] < 650)) && (esp_timer_get_time() > (lastCurve + 750000))) {
+		
+		// activate LEDs on the side where the vehicle is turning to (purely decorative, not necessary)
 		leds.setBrightness(outsideBorder ? 15 : 0, outsideBorder ? 0 : 15);
+
+		// set servo to 20° angle
 		servo.setAngle(outsideBorder ? -20.0f : 20.0f);
+
+		// drive until rotation difference > 55° (not 90° because of sensor and servo latency)
 		targetRotation += outsideBorder ? -55.0f : 55.0f;
 		do {
-			rotation = mpu9250.getRotation();
-			rotation.z += rotationOffset;
+			rotation = mpu9250.getRotation().z - rotationOffset;
 			vTaskDelay(5);
-		} while (outsideBorder ? (targetRotation < rotation.z) : (targetRotation > rotation.z));
+		} while (outsideBorder ? (targetRotation < rotation) : (targetRotation > rotation));
+
+		// set "real" target rotation (before the curve + 90°)
 		targetRotation += outsideBorder ? -35.0f : 35.0f;
+
+		// turn of cosmetic LEDs
 		leds.setBrightness(0, 0);
+
+		// set servo to 0° again
 		servo.setAngle(0.0f);
-		motor.setSpeed(SPEED_NORMAL);
+
+		// save time since boot for curve cooldown
 		lastCurve = esp_timer_get_time();
+
+		// small delay when driving on the final section - to be tested
 		if(abs(targetRotation) >= 1080.0f) vTaskDelay(500);
-		if(!outsideBorder) rotationOffset += 1.5f;
 	}
 
-	// border correction
+	// border correction (drive away from borders when getting too close)
+	// inactive when next curve is expected (front distance <= 900 mm)
 	else if ((distances[LEFT] < 150) && (distances[FRONT] > 900)) {
-		servo.setAngle(((targetRotation - rotation.z) > -20.0f) ? 6.0f : 0.0f);
+
+		// limit angle while driving away from border to 20°
+		servo.setAngle(((targetRotation - rotation) > -20.0f) ? 6.0f : 0.0f);
 		vTaskDelay(50);
 	}
 	else if ((distances[RIGHT] < 150) && (distances[FRONT] > 900)) {
-		servo.setAngle(((targetRotation - rotation.z) < 20.0f) ? -6.0f : 0.0f);
+
+		// limit angle while driving away from border to 20°
+		servo.setAngle(((targetRotation - rotation) < 20.0f) ? -6.0f : 0.0f);
 		vTaskDelay(50);
 	}
 
-	// gyro correction
-	else if ((targetRotation - rotation.z) < -2.0f) servo.setAngle(max(targetRotation - rotation.z + 2.0f, -7.0f));
-	else if ((targetRotation - rotation.z) >  2.0f) servo.setAngle(min(targetRotation - rotation.z - 2.0f,  7.0f));
+	// rotation correction (rotate towards target rotation when not driving away from borders)
+	else if ((targetRotation - rotation) < -2.0f) servo.setAngle(max(targetRotation - rotation + 2.0f, -7.0f));
+	else if ((targetRotation - rotation) >  2.0f) servo.setAngle(min(targetRotation - rotation - 2.0f,  7.0f));
 
-	// straight driving
+	// drive straight when no correction is required
 	else servo.setAngle(0.0f);
 }
 
@@ -224,7 +261,7 @@ constexpr float SPEED_MAX1		 	= 0.50f;
 constexpr float SPEED_MIN23 	 	= 0.50f;
 constexpr float SPEED_MAX23		 	= 0.60f;
 constexpr float SPEED_END		 	= 0.50f;
-constexpr float MIN_RCR_ANGLE	 	= 1.00f;
+constexpr float MIN_RCR_ANGLE	 	= 0.20f;
 constexpr float TRACK_CR_ANGLE	 	= 10.0f;
 constexpr float TRACK_CR_STRENGTH 	= 1.00f;
 
@@ -235,7 +272,7 @@ int64_t startTime = 0;
 float rotationOffset = 0.0f;
 int64_t lastCurve = 0;
 uint8_t section[4][3] = {};
-bool drivingSide = 0;
+int8_t drivingSide = 2;
 bool parkingSpace = 0;
 
 int distance;
@@ -249,7 +286,7 @@ void correctRotationOffset(bool side, uint64_t waitTicks = 500) {
 }
 
 void curve(bool direction) {
-	motor.setSpeed(0.45f);
+	motor.setSpeed(0.3f);
 	leds.setBrightness(direction ? 0 : 15, direction ? 15 : 0);
 	servo.setAngle(direction ? 40.0f : -40.0f);
 	curveTargetRotation += direction ? 90 : -90;
@@ -257,11 +294,12 @@ void curve(bool direction) {
 	while (direction ? ((mpu9250.getRotation().z + rotationOffset) < (curveTargetRotation - 25.0f)) : ((mpu9250.getRotation().z + rotationOffset) > (curveTargetRotation + 25.0f))) vTaskDelay(1);
 	leds.setBrightness(0, 0);
 	servo.setAngle(0.0f);
+	motor.setSpeed(0.5f);
 }
 
 void rotationCorrection(bool invert = false, bool offsetCorrection = false, bool endCorrection = false) {
 	float rotation = mpu9250.getRotation().z + rotationOffset;
-	if 		(targetRotation - rotation < MIN_RCR_ANGLE) servo.setAngle(invert ? -max(targetRotation - rotation + MIN_RCR_ANGLE, -10.0f) : max(targetRotation - rotation + MIN_RCR_ANGLE, -10.0f));
+	if (targetRotation - rotation < MIN_RCR_ANGLE) servo.setAngle(invert ? -max(targetRotation - rotation + MIN_RCR_ANGLE, -10.0f) : max(targetRotation - rotation + MIN_RCR_ANGLE, -10.0f));
 	else if (targetRotation - rotation > MIN_RCR_ANGLE) servo.setAngle(invert ? -min(targetRotation - rotation - MIN_RCR_ANGLE,  10.0f) : min(targetRotation - rotation - MIN_RCR_ANGLE,  10.0f));
 	else if (vl53l1x.getDistance(FRONT) > 1500) {
 		servo.setAngle(0.0f);
@@ -329,7 +367,7 @@ void setup() {
 				}
 			}
 		}
-		if(!section[0][2]) section[0][2] = 3;
+		if(section[0][2] == 0) section[0][2] = 3;
 		if(section[0][2] == RED) {
 			drivingSide = outsideBorder;
 			while (vl53l1x.getDistance(FRONT) > 600) rotationCorrection();
@@ -365,7 +403,7 @@ void setup() {
 			if(camera.getObject(i).c != PINK) {
 				if(camera.getObject(i).l < 650) {
 					if(camera.getObject(i).b > 500) section[0][1] = camera.getObject(i).c;
-					else if (camera.getObject(i).b > 420) section[0][2] = camera.getObject(i).c;
+					else if (camera.getObject(i).b > 440) section[0][2] = camera.getObject(i).c;
 				}
 			}
 		}
@@ -399,8 +437,10 @@ void setup() {
 	}
 	while (vl53l1x.getDistance(!outsideBorder) < 1500) rotationCorrection();
 
-	motor.setSpeed(0.0f);
-	lcd.showString(String(section[0][0]) + '\n' + String(section[0][1]) + '\n' + String(section[0][2]));
+	/*motor.setSpeed(0.0f);
+	*/lcd.showString(String(section[0][0]) + '\n' + String(section[0][1]) + '\n' + String(section[0][2]));
+
+	/*while(true);*/
 
 
 
@@ -415,7 +455,7 @@ void setup() {
 
 	for(int j = 1; j <= 3; j++) {
 		if(drivingSide == outsideBorder) {
-			while(vl53l1x.getDistance(FRONT) > 950) rotationCorrection();
+			while(vl53l1x.getDistance(FRONT) > 975) rotationCorrection();
 			curve(!outsideBorder);
 			motor.setSpeed(-0.35f);
 			while(vl53l1x.getDistance(BACK) > 110) rotationCorrection(true);
@@ -425,9 +465,9 @@ void setup() {
 		else {
 			while(vl53l1x.getDistance(FRONT) > 500) rotationCorrection();
 			motor.setSpeed(-SPEED_MIN1);
-			while(vl53l1x.getDistance(FRONT) < 620) rotationCorrection();
+			while(vl53l1x.getDistance(FRONT) < 650) rotationCorrection();
 			if(outsideBorder == 0){
-				motor.setSpeed(-0.45f);
+				motor.setSpeed(-0.3f);
 				leds.setBrightness(0,15);
 				servo.setAngle(-40.0f);
 				curveTargetRotation += 90;
@@ -435,7 +475,7 @@ void setup() {
 				while ((mpu9250.getRotation().z + rotationOffset) < (curveTargetRotation - 25.0f)) vTaskDelay(1);
 			}
 			else if(outsideBorder == 1){
-				motor.setSpeed(-0.45f);
+				motor.setSpeed(-0.3f);
 				leds.setBrightness(0,15);
 				servo.setAngle(40.0f);
 				curveTargetRotation += -90;
@@ -487,7 +527,7 @@ void setup() {
 		if(section[j][0] != 3){
 			if((section[j][0] == (outsideBorder? RED : GREEN))){
 				curve(outsideBorder);
-				while(vl53l1x.getDistance(FRONT) > 370) rotationCorrection();
+				while(vl53l1x.getDistance(FRONT) > 340) rotationCorrection();
 				curve(!outsideBorder);
 				drivingSide = outsideBorder;
 			}
@@ -562,7 +602,7 @@ void setup() {
 
 
 	if(drivingSide == outsideBorder){
-		while(vl53l1x.getDistance(FRONT) > 950) rotationCorrection();
+		while(vl53l1x.getDistance(FRONT) > 975) rotationCorrection();
 		curve(!outsideBorder);
 		motor.setSpeed(-0.35f);
 		while(vl53l1x.getDistance(BACK) > 110) rotationCorrection(true);
@@ -574,7 +614,7 @@ void setup() {
 		motor.setSpeed(-SPEED_MIN1);
 		while(vl53l1x.getDistance(FRONT) < 620) rotationCorrection();
 		if(outsideBorder == 0){
-			motor.setSpeed(-0.45f);
+			motor.setSpeed(-0.3f);
 			leds.setBrightness(0,15);
 			servo.setAngle(-40.0f);
 			curveTargetRotation += 90;
@@ -582,7 +622,7 @@ void setup() {
 			while ((mpu9250.getRotation().z + rotationOffset) < (curveTargetRotation - 25.0f)) vTaskDelay(1);
 		}
 		else if(outsideBorder == 1){
-			motor.setSpeed(-0.45f);
+			motor.setSpeed(-0.3f);
 			leds.setBrightness(0,15);
 			servo.setAngle(40.0f);
 			curveTargetRotation += -90;
@@ -598,7 +638,7 @@ void setup() {
 
 	drivingSide = !outsideBorder;
 
-	int j = 1;
+	int j = 0;
 	if(outsideBorder == 1){
 		
 
@@ -642,7 +682,7 @@ void setup() {
 	if(section[j][0] != 3){
 		if((section[j][0] == (outsideBorder? RED : GREEN))){
 			curve(outsideBorder);
-			while(vl53l1x.getDistance(FRONT) > 570) rotationCorrection();
+			while(vl53l1x.getDistance(FRONT) > 520) rotationCorrection();
 			curve(!outsideBorder);
 			drivingSide = outsideBorder;
 		}
@@ -651,7 +691,8 @@ void setup() {
 		while(wait_time > (esp_timer_get_time() - 1000000)) rotationCorrection;
 		while(vl53l1x.getDistance(FRONT) > 1900|| vl53l1x.getDistance(BACK) < 1100) rotationCorrection();
 		motor.setSpeed(0);
-		vTaskDelay(100);
+		vTaskDelay(1000);
+		//lcd.showString(String(section[0][0]) + '\n' + String(section[0][1]) + '\n' + String(section[0][2]));
 		
 		if((section[j][2] == (!outsideBorder? RED : GREEN))&& drivingSide == outsideBorder){
 			curve(!outsideBorder);
@@ -662,7 +703,7 @@ void setup() {
 		}
 		if((section[j][2] == (outsideBorder? RED : GREEN))&& drivingSide != outsideBorder){
 			curve(outsideBorder);
-			while(vl53l1x.getDistance(FRONT) > 570) rotationCorrection();
+			while(vl53l1x.getDistance(FRONT) > 520) rotationCorrection();
 			curve(!outsideBorder);
 			drivingSide = outsideBorder;
 			vTaskDelay(50);
@@ -675,7 +716,7 @@ void setup() {
 	else{
 		if((section[j][1] == (outsideBorder? RED : GREEN))||((section[j][1]==3)&&(section[j][2] == (outsideBorder? RED : GREEN)))){
 			curve(outsideBorder);
-			while(vl53l1x.getDistance(FRONT) > 570) rotationCorrection();
+			while(vl53l1x.getDistance(FRONT) > 520) rotationCorrection();
 			curve(!outsideBorder);
 			drivingSide = outsideBorder;
 			vTaskDelay(50);
@@ -703,20 +744,21 @@ void setup() {
 		if(((section[k % 4][0] == (outsideBorder? RED : GREEN)) || ((section[k % 4][0] == 3)&&(section[k % 4][1] == (outsideBorder? RED : GREEN)))) || ((section[k % 4][0] == 3)&&(section[k % 4][1] == 3 )&&(section[k % 4][2] == (outsideBorder? RED : GREEN)))) {
 			drivingSide = outsideBorder;
 			//motor.setSpeed(0);
-			while(vl53l1x.getDistance(FRONT) > (((k % 4) == 0)? 570 : 360)) rotationCorrection();
+			while(vl53l1x.getDistance(FRONT) > (((k % 4) == 0)? 520 : 300)) rotationCorrection();
 		}
 		else drivingSide = !outsideBorder;
 		//motor.setSpeed(0);
 		//vTaskDelay(1000);
 		curve(!outsideBorder);
-		vTaskDelay(150);
+		int64_t t = esp_timer_get_time() + 1000000;
+		while(esp_timer_get_time() < t) rotationCorrection();
 		while((vl53l1x.getDistance(FRONT) > 1800) || (vl53l1x.getDistance(BACK) < 1200)) rotationCorrection(); ////////////////////////////////////////////////////////////
 		//motor.setSpeed(0);
 		//vTaskDelay(1000);
 		if(section[k % 4][0] != 3 && section[k % 4][0] != section[k % 4][2]){
 			if((section[k % 4][2] == (outsideBorder? RED : GREEN))&&(drivingSide!= outsideBorder)){
 				curve(outsideBorder);
-				while(vl53l1x.getDistance(FRONT) > (((k % 4) == 0)? 570 : 360)) rotationCorrection();
+				while(vl53l1x.getDistance(FRONT) > (((k % 4) == 0)? 520 : 360)) rotationCorrection();
 				curve(!outsideBorder);
 				drivingSide = outsideBorder;
 			}
@@ -735,8 +777,10 @@ void setup() {
 			
 		}*/
 		//motor.setSpeed(0);
-		vTaskDelay(200);
-		while((vl53l1x.getDistance(!outsideBorder) < 1100)||(vl53l1x.getDistance(FRONT) > 1500)) rotationCorrection();
+		vTaskDelay(100);
+		while((vl53l1x.getDistance(!outsideBorder) < 1000)||(vl53l1x.getDistance(FRONT) > 1500)||(vl53l1x.getDistance(BACK) < 800)) rotationCorrection();
+		vTaskDelay(100);
+		while((vl53l1x.getDistance(!outsideBorder) < 1000)||(vl53l1x.getDistance(FRONT) > 1500)||(vl53l1x.getDistance(BACK) < 800)) rotationCorrection();
 		
 	
 	}
@@ -751,27 +795,75 @@ void setup() {
 	if(((section[0][0] == (outsideBorder? RED : GREEN)) || ((section[0][0] == 3)&&(section[0][1] == (outsideBorder? RED : GREEN)))) || ((section[0][0] == 3)&&(section[0][1] == 3 )&&(section[0][2] == (outsideBorder? RED : GREEN)))) {
 		drivingSide = outsideBorder;
 		//motor.setSpeed(0);
-		while(vl53l1x.getDistance(FRONT) > (570)) rotationCorrection();
+		while(vl53l1x.getDistance(FRONT) > (520)) rotationCorrection();
 	}
 	else drivingSide = !outsideBorder;
 	//motor.setSpeed(0);
 	//vTaskDelay(1000);
 	curve(!outsideBorder);
 	vTaskDelay(150);
-	while((vl53l1x.getDistance(FRONT) > 1800) || (vl53l1x.getDistance(BACK) < 1200)) rotationCorrection();
-	motor.setSpeed(0);
 
+
+
+
+	/*while((vl53l1x.getDistance(FRONT) > 1800) || (vl53l1x.getDistance(BACK) < 1200)) rotationCorrection();
+	motor.setSpeed(0);*/
+
+
+	/*if(!outsideBorder){
+		while(vl53l1x.getDistance(outsideBorder) > 900 || vl53l1x.getDistance(BACK) <1000)rotationCorrection();
+		curve(outsideBorder);
+		while(vl53l1x.getDistance(FRONT) > 15) rotationCorrection();
+		motor.setSpeed(0);
+	}
+	else{
+		motor.setSpeed(0.35f);
+		while(vl53l1x.getDistance(FRONT) > 1200) rotationCorrection();
+
+		curve(outsideBorder);
+		while(vl53l1x.getDistance(FRONT) > 15) rotationCorrection();
+		motor.setSpeed(0);
+	}*/
+
+	motor.setSpeed(0.3);
+	if(outsideBorder){
+		while(vl53l1x.getDistance(FRONT) > 1500 || vl53l1x.getDistance(BACK) < 1500) rotationCorrection();
+		if(outsideBorder == drivingSide){
+			int16_t lastdistance = vl53l1x.getDistance(outsideBorder);
+			while(lastdistance - vl53l1x.getDistance(outsideBorder) < 100) rotationCorrection();
+			drivingSide = 2;
+			motor.setSpeed(-0.3);
+			vTaskDelay(950);
+			curve(outsideBorder);
+			while(vl53l1x.getDistance(FRONT) > 15) rotationCorrection();
+			motor.setSpeed(0);
+		}
+		else{
+			while((vl53l1x.getDistance(FRONT) > 1800) || (vl53l1x.getDistance(BACK) < 1200)) rotationCorrection();
+			uint16_t lastdistance = vl53l1x.getDistance(outsideBorder);
+			while(lastdistance - vl53l1x.getDistance(outsideBorder)  <  100) rotationCorrection();
+			drivingSide = 2;
+			motor.setSpeed(-0.3);
+			vTaskDelay(950);
+			curve(outsideBorder);
+			while(vl53l1x.getDistance(FRONT) > 15) rotationCorrection();
+			motor.setSpeed(0);
+		}
+	}
+	else {
+		while(vl53l1x.getDistance(BACK) < 850) rotationCorrection();
+		curve(outsideBorder);
+		while(vl53l1x.getDistance(FRONT) > 15) rotationCorrection();
+			motor.setSpeed(0);
+	}
 	
-	
+	lcd.showFinish(esp_timer_get_time() - startTime);
 
 #endif
 
 }
 
-void loop() {
-
-
-}
+void loop() {}
 
 #endif
 #endif

@@ -11,8 +11,8 @@
 
     "hailo_yolo_inference":
     {
-        "hef_file": "/home/terra/Documents/WRO RPI5/yolov11s_hailo8.hef",
-        "max_detections": 10,
+        "hef_file": "/home/terra/Documents/WRO RPI5/yolov11s.hef",
+        "max_detections": 100,
         "threshold": 0.5
     }
 }
