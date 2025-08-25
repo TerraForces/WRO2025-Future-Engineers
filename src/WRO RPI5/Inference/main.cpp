@@ -30,7 +30,7 @@ struct OBJECT {
 // program start
 int main() {
 
-    // start UART bus at 115200 bits per second
+    // configure and start UART bus at 115200 bits per second
     int32_t uart = open("/dev/ttyAMA0", O_RDWR);
     termios tty;
     tcgetattr(uart, &tty);

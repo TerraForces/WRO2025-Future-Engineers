@@ -64,7 +64,7 @@ namespace CAR {
         // returns object at a specified index (presorted by relevance)
         // @param idx index of object to fetch
         // @returns object at the specified index or empty object if not existing
-        OBJECT getObject(uint8_t idx);
+        OBJECT getObject(uint16_t idx);
 
         // returns whether the Raspberry Pi 5 is ready and has started inference
         // @returns true if ready, false if not

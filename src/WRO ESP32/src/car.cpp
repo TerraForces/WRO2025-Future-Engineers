@@ -66,9 +66,9 @@ constexpr uint8_t Pin_Start_Button           = 39; // input  - start button (ext
 // motor pwm configuration
 constexpr uint16_t Motor_PWM_Min_Frequency   = 8000;  // minimal pwm frequency used for motor pwm (hz)
 constexpr uint16_t Motor_PWM_Max_Frequency   = 12000; // maximum pwm frequency used for motor pwm (hz)
-constexpr float Motor_PWM_Time_To_Max        = 2.00f; // time in seconds for the motor pwm to reach maximum speed from idle
+constexpr float Motor_PWM_Time_To_Max        = 1.60f; // time in seconds for the motor pwm to reach maximum speed from idle
 constexpr float Motor_PWM_Time_To_Null       = 0.50f; // time in seconds for the motor pwm to reach idle from maximum speed
-constexpr float Motor_PWM_Update_Interval    = 0.05f; // motor pwm update interval in seconds
+constexpr float Motor_PWM_Update_Interval    = 0.04f; // motor pwm update interval in seconds
 
 // servo pwm configuration
 constexpr uint16_t Servo_PWM_0_Duty          = 7940;  // servo pwm duty in 0° position (might be adjusted after hardware changes)
@@ -89,18 +89,19 @@ volatile int16_t rounds[3] = {};            // full rotation rounds performed (r
 volatile uint16_t distances[4] = {};        // last distance data received from vl53l1x sensors (in mm)
 volatile uint8_t ledState = 0x00;           // led brightness to be sent to IO extender
 volatile int32_t motorTargetDuty = 0;       // motor target duty for acceleration ramp
-volatile uint64_t taskFlowFailures[4] = {}; // number of skipped task delays (indicator for critical core usage)
+volatile uint64_t taskFlowFailures[3] = {}; // number of skipped task delays (indicator for critical core usage)
 
 // global working variables
-SPIClass hspi(HSPI);
-Adafruit_ST7735 st7735(&hspi, Pin_ST7735_CS, Pin_ST7735_DC, Pin_ST7735_RST);
-OneWire oneWire = OneWire(Pin_DS18B20_OneWire);
-uint8_t ds18b20Address[8] = {};
-std::vector<CAR::OBJECT> detections = { CAR::OBJECT {0, 0, 0, 0, 0, 0 } }, currentDetections;
-SemaphoreHandle_t uartMutexLock = 0;
-uart_t* uart = 0;
-constexpr uint16_t objectColors[4] = { 0x0000, 0xF800, 0x0600, 0xF81F };
-constexpr uint8_t vl53l1xConfiguration[91] = {
+SPIClass hspi(HSPI);                                                         // hardware SPI bus object modified to work without MISO
+Adafruit_ST7735 st7735(&hspi, Pin_ST7735_CS, Pin_ST7735_DC, Pin_ST7735_RST); // lcd display object with communication using hardware SPI
+OneWire oneWire = OneWire(Pin_DS18B20_OneWire);                              // OneWire bus object for communication with the DS18B20 temperature sensor
+uint8_t ds18b20Address[8] = {};                                              // 64-bit DS18B20 temperature sensor address
+std::vector<CAR::OBJECT> currentDetections,                                  // UART receive data buffer (list of detected objects)
+    detections = { CAR::OBJECT {0, 0, 0, 0, 0, 0 } };                        // last complete object data transmission (empty object until first data received from RPi 5)
+uart_t* uart = 0;                                                            // UART bus handle (used to control UART bus)
+constexpr uint16_t objectColors[4] = { 0x0000, 0xF800, 0x0600, 0xF81F };     // object colors on display (purely cosmetical)
+volatile uint8_t vl53l1xViewCenters[4] = { 198, 199, 63, 61 };               // index of center sensor of the active sensoring area of the VL53L1X distance sensors
+constexpr uint8_t vl53l1xConfiguration[91] = {                               // VL53L1X distance sensor default register configuration
 	0x00, 0x01, 0x01, 0x01, 0x02, 0x00, 0x02, 0x08,
     0x00, 0x08, 0x10, 0x01, 0x01, 0x00, 0x00, 0x00,
     0x00, 0xff, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00,
@@ -114,81 +115,97 @@ constexpr uint8_t vl53l1xConfiguration[91] = {
     0x00, 0x02, 0xc7, 0xff, 0x9B, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x00
 };
-volatile uint8_t vl53l1xViewCenters[4] = { 198, 199, 63, 61 };
-volatile uint8_t lastVl53l1xViewCenters[4] = {};
 
+// read 8-bit register from VL53L1X ToF sensor
 uint8_t vl53l1xReadByte(uint8_t add, uint16_t reg) {
-    for(uint8_t i = 0; i < 5; i++) {
-        Wire1.beginTransmission(add);
-        Wire1.write(reg >> 8);
-        Wire1.write(reg & 0xFF);
-        if(Wire1.endTransmission(false) == 0) break;
+    for(uint8_t i = 0; i < 5; i++) {                 // try sending register address up to 5 times
+        Wire1.beginTransmission(add);                // start I2C transmission to sensor address
+        Wire1.write(reg >> 8);                       // write first byte of register address
+        Wire1.write(reg & 0xFF);                     // write second byte of register address
+        if(Wire1.endTransmission(false) == 0) break; // end I2C transmission without sending stop command
     }
-    Wire1.requestFrom(add, (uint8_t)1);
-    return Wire1.available() ? Wire1.read() : 0;
+    Wire1.requestFrom(add, (uint8_t)1);              // request one byte from VL53L1X sensor
+    return Wire1.read();                             // read data byte from receive buffer
 }
 
+// read 16-bit register from VL53L1X ToF sensor
 uint16_t vl53l1xReadWord(uint8_t add, uint16_t reg) {
-    for(uint8_t i = 0; i < 5; i++) {
-        Wire1.beginTransmission(add);
-        Wire1.write(reg >> 8);
-        Wire1.write(reg & 0xFF);
-        if(Wire1.endTransmission(false) == 0) break;
+    for(uint8_t i = 0; i < 5; i++) {                 // try sending register address up to 5 times
+        Wire1.beginTransmission(add);                // start I2C transmission to sensor address
+        Wire1.write(reg >> 8);                       // write first byte of register address
+        Wire1.write(reg & 0xFF);                     // write second byte of register address
+        if(Wire1.endTransmission(false) == 0) break; // end I2C transmission without sending stop command
     }
-    Wire1.requestFrom(add, (uint8_t)2);
-    uint8_t firstByte = Wire1.read();
-    uint8_t secondByte = Wire1.read();
-    return (firstByte << 8) + secondByte;
+    Wire1.requestFrom(add, (uint8_t)2);              // request two bytes from VL53L1X sensor
+    uint16_t firstByte = Wire1.read();               // read first byte from receive buffer
+    return (firstByte << 8) | (uint8_t)Wire1.read(); // read second byte from receive buffer and combine to 16-bit value
 }
 
+// write to 8-bit register of VL53L1X sensor
 void vl53l1xWriteByte(uint8_t add, uint16_t reg, uint8_t data) {
-    Wire1.beginTransmission(add);
-    Wire1.write(reg >> 8);
-    Wire1.write(reg & 0xFF);
-    Wire1.write(data);
-    Wire1.endTransmission(true);
+    Wire1.beginTransmission(add); // start I2C transmission to sensor address
+    Wire1.write(reg >> 8);        // write first byte of register address
+    Wire1.write(reg & 0xFF);      // write second byte of register address
+    Wire1.write(data);            // write data to the register
+    Wire1.endTransmission(true);  // end transmission and send stop bit
 }
 
+// write to 16-bit register of VL53L1X sensor
 void vl53l1xWriteWord(uint8_t add, uint16_t reg, uint16_t data) {
-    Wire1.beginTransmission(add);
-    Wire1.write(reg >> 8);
-    Wire1.write(reg & 0xFF);
-    Wire1.write(data >> 8);
-    Wire1.write(data & 0xFF);
-    Wire1.endTransmission(true);
+    Wire1.beginTransmission(add); // start I2C transmission to sensor address
+    Wire1.write(reg >> 8);        // write first byte of register address
+    Wire1.write(reg & 0xFF);      // write second byte of register address
+    Wire1.write(data >> 8);       // write first byte of data to the register
+    Wire1.write(data & 0xFF);     // write second byte of data to the register
+    Wire1.endTransmission(true);  // end transmission and send stop bit
 }
 
+// write to 32-bit register of VL53L1X sensor
 void vl53l1xWriteDWord(uint8_t add, uint16_t reg, uint32_t data) {
-    Wire1.beginTransmission(add);
-    Wire1.write(reg >> 8);
-    Wire1.write(reg & 0xFF);
-    Wire1.write(data >> 24);
-    Wire1.write((data >> 16) & 0xFF);
-    Wire1.write((data >> 8) & 0xFF);
-    Wire1.write(data & 0xFF);
-    Wire1.endTransmission(true);
+    Wire1.beginTransmission(add);     // start I2C transmission to sensor address
+    Wire1.write(reg >> 8);            // write first byte of register address
+    Wire1.write(reg & 0xFF);          // write second byte of register address
+    Wire1.write(data >> 24);          // write first byte of data to the register
+    Wire1.write((data >> 16) & 0xFF); // write second byte of data to the register
+    Wire1.write((data >> 8) & 0xFF);  // write third byte of data to the register
+    Wire1.write(data & 0xFF);         // write fourth byte of data to the register
+    Wire1.endTransmission(true);      // end transmission and send stop bit
 }
 
+// interrupt function activated when state of Pin_MPU9250_Data_Ready changes from HIGH to LOW
 void mpu9250_interrupt() {
     BaseType_t higherPriorityTaskWoken = 0;
+    // send notification to i2cThread0 running i2c0_task
 	xTaskNotifyFromISR(i2cThread0, 0, eNoAction, &higherPriorityTaskWoken);
 }
 
+// convert quaternion value to float for further calculations
 inline float qToFloat(long value) {
     return (value >> 30) + ((value & 0x3FFFFFFF) / (float)0x40000000);
 }
 
+// task which reads MPU-9250 sensor data when receiving a data ready interrupt
 void i2c0_task(void* unused) {
+
+    // attach interrupt function which sends notifications to this task when pin state changes from HIGH to LOW
     attachInterrupt(Pin_MPU9250_Data_Ready, mpu9250_interrupt, FALLING);
     while(true) {
+
+        // wait for notification from interrupt function
 		if(xTaskNotifyWait(0, 0, 0, 20) == pdPASS) {
+
+            // read data from MPU-9250 digital motion processor FiFo buffer
             short gyro[3], accel[3], sensors;
             long quat[4], raw[4];
             unsigned long timestamp;
             unsigned char more;
             dmp_read_fifo(gyro, accel, quat, &timestamp, &sensors, &more);
             memcpy(raw, quat, 16);
+
+            // try to read newer data if available (required to always receive latest data)
             if (!dmp_read_fifo(gyro, accel, quat, &timestamp, &sensors, &more)) memcpy(raw, quat, 16);
+
+            // convert quaternion rotation data to euler angles (0° - 360°)
             float a0 = qToFloat(quat[0]);
             float a1 = qToFloat(quat[1]);
             float a2 = qToFloat(quat[2]);
@@ -199,6 +216,8 @@ void i2c0_task(void* unused) {
                 atan2(2.0f * ((a2 * a3) - (a0 * a1)), (-2.0f * ((a1 * a1) + (a2 * a2))) + 1.0f) * 57.29577951308232f,
                 atan2(2.0f * ((a1 * a2) - (a0 * a3)), (-2.0f * ((a2 * a2) + (a3 * a3))) + 1.0f) * 57.29577951308232f
             };
+
+            // count rounds for each rotation dimension by simply in-/decreasing the rounds when it jumps between 0°/360°
             for(uint8_t i = 0; i < 3; i++) {
                 if(degrees[i] < 0.0f) degrees[i] += 360.0f;
                 if((degrees[i] < 60.0f) && (lastRotation[i] > 300.0f)) rounds[i]++;
@@ -206,23 +225,38 @@ void i2c0_task(void* unused) {
                 lastRotation[i] = degrees[i];
             }
         }
+
+        // count when no notifications arrive during 20 ms (should not happen normally)
         else taskFlowFailures[0]++;
 	}
 }
 
+// task which periodically reads distance data and changes LED state
 void i2c1_task(void* unused) {
+
+    // start I2C transmission to address 0x20 (MCP23008-E/P)
     Wire1.beginTransmission(0x20);
+
+    // write 0x00 to register 0x00 (configures all pins to be outputs)
     Wire1.write(0x00);
     Wire1.write(0x00);
+
+    // end I2C transmission
     Wire1.endTransmission(true);
 
+    // start periodic measuring on all of the 4 sensors
+    uint8_t lastVl53l1xViewCenters[4] = {};
     for(uint8_t i = 0; i < 4; i++) {
+        lastVl53l1xViewCenters[i] = vl53l1xViewCenters[i];
         vl53l1xWriteByte(0x30 + i, 0x0086, 0x01);
         vl53l1xWriteByte(0x30 + i, 0x0087, 0x40);
     }
+
     TickType_t lastWaitTime = xTaskGetTickCount();
     uint8_t lastLedState = 0;
     while(true) {
+
+        // try to execute every 6 ms and increase fail counter when loop takes more than 6 ms or other tasks steal computing time (should not happen, only for debugging)
 		if(!xTaskDelayUntil(&lastWaitTime, 6)) taskFlowFailures[1]++;
 
         // set new led state only if it has changed
@@ -239,11 +273,17 @@ void i2c1_task(void* unused) {
             // end I2C transmission
             SNIPE(Wire1.endTransmission(true));
         }
+
+        // read distance data and set new view centers for all 4 sensors
         for(uint8_t i = 0; i < 4; i++) {
+
+            // read distance data if new value is available
             if((vl53l1xReadByte(0x30 + i, 0x0031) & 1) == (!((vl53l1xReadByte(0x30 + i, 0x0030) >> 4) & 1))) {
                 vl53l1xWriteByte(0x30 + i, 0x0086, 0x01);
                 distances[i] = vl53l1xReadWord(0x30 + i, 0x0096);
             }
+
+            // set new viewport centers if asked for
             if(lastVl53l1xViewCenters[i] != vl53l1xViewCenters[i]) {
                 vl53l1xWriteByte(0x30 + i, 0x0087, 0x00);
                 vl53l1xWriteByte(0x30 + i, 0x007F, vl53l1xViewCenters[i]);
@@ -255,6 +295,7 @@ void i2c1_task(void* unused) {
 	}
 }
 
+// acceleration control task (motor PWM regulation)
 void motor_control_task(void* unused) {
 	TickType_t lastWakeTime = xTaskGetTickCount();
     constexpr TickType_t updateInterval = (1000 * Motor_PWM_Update_Interval) + 0.5;
@@ -263,29 +304,49 @@ void motor_control_task(void* unused) {
 	constexpr int32_t motorAccelerationRate = (motorMaxDuty * Motor_PWM_Update_Interval / Motor_PWM_Time_To_Max) + 0.5;
 	constexpr int32_t motorDeaccelerationRate = (motorMaxDuty * Motor_PWM_Update_Interval / Motor_PWM_Time_To_Null) + 0.5;
 	while(true) {
-		if(!xTaskDelayUntil(&lastWakeTime, updateInterval)) taskFlowFailures[2]++;
+		
+        // wait for next execution or increase failure count if execution takes too long (indicates overloaded CPU core)
+        if(!xTaskDelayUntil(&lastWakeTime, updateInterval)) taskFlowFailures[2]++; 
+        
+        // copy motor target speed value
+        int32_t motorTargetDuty = ::motorTargetDuty;
+
+        // add next (de-)acceleration step
         if     ((currentMotorDuty >= 0) && (motorTargetDuty > currentMotorDuty)) currentMotorDuty = _min(motorTargetDuty, currentMotorDuty + motorAccelerationRate);
-        else if((currentMotorDuty >= 0) && (motorTargetDuty < currentMotorDuty)) currentMotorDuty = _max(motorTargetDuty, currentMotorDuty - motorDeaccelerationRate);
-        else if((currentMotorDuty <= 0) && (motorTargetDuty > currentMotorDuty)) currentMotorDuty = _min(motorTargetDuty, currentMotorDuty + motorDeaccelerationRate);
+        else if((currentMotorDuty > 0) && (motorTargetDuty < currentMotorDuty)) currentMotorDuty = _max(_max(motorTargetDuty, 0), currentMotorDuty - motorDeaccelerationRate);
+        else if((currentMotorDuty < 0) && (motorTargetDuty > currentMotorDuty)) currentMotorDuty = _min(_min(motorTargetDuty, 0), currentMotorDuty + motorDeaccelerationRate);
         else if((currentMotorDuty <= 0) && (motorTargetDuty < currentMotorDuty)) currentMotorDuty = _max(motorTargetDuty, currentMotorDuty - motorAccelerationRate);
-		SNIPE(ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, (uint32_t)((Motor_PWM_Max_Frequency - Motor_PWM_Min_Frequency) * (abs(currentMotorDuty) / (float)motorMaxDuty)) + Motor_PWM_Min_Frequency));
+		
+        // update PWM frequency and duty cycle and set relais state
+        SNIPE(ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, (uint32_t)((Motor_PWM_Max_Frequency - Motor_PWM_Min_Frequency) * (abs(currentMotorDuty) / (float)motorMaxDuty)) + Motor_PWM_Min_Frequency));
 		SNIPE(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, abs(currentMotorDuty)));
 		SNIPE(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
 		digitalWrite(Pin_Motor_Direction_Invert, currentMotorDuty < 0);
 	}
 }
 
+// task with seconds highest priority possible; receives data from the Raspberry Pi 5 over UART
 void uart_task(void* unused) {
     uart_event_t event;
     QueueHandle_t uartEventQueue = 0;
     uartGetEventQueue(uart, &uartEventQueue);
     while(true) {
+        
+        // wait for new UART bus event
         if(xQueueReceive(uartEventQueue, &event, portMAX_DELAY)) {
+
+            // only do something when full object structure available
             if(event.type == UART_DATA) {
                 while(uartAvailable(uart) >= sizeof(CAR::OBJECT)) {
                     CAR::OBJECT object = {};
+
+                    // read new object data from UART
                     uartReadBytes(uart, (uint8_t*)&object, sizeof(CAR::OBJECT), 0);
+
+                    // add object to receive buffer
                     if(object.c) currentDetections.push_back(object);
+
+                    // or copy received objects and clear receive buffer when receiving an empty object
                     else {
                         detections = currentDetections;
                         currentDetections.clear();
@@ -296,20 +357,24 @@ void uart_task(void* unused) {
     }
 }
 
+// sets button pin modes and deactivate LED
 CAR::BUTTON::BUTTON() {
     pinMode(Pin_Start_Button, INPUT);
     pinMode(Pin_Start_Button_LED, OUTPUT);
     digitalWrite(Pin_Start_Button_LED, LOW);
 }
 
+// button is pressed when pin reads LOW (external pullup)
 bool CAR::BUTTON::pressed() {
     return !digitalRead(Pin_Start_Button);
 }
 
+// set LED state by writing to output pin
 void CAR::BUTTON::setLED(bool state) {
     digitalWrite(Pin_Start_Button_LED, state);
 }
 
+// activate LED, wait for button press and deactivate LED again
 void CAR::BUTTON::wait() {
     digitalWrite(Pin_Start_Button_LED, HIGH);
     while(digitalRead(Pin_Start_Button)) vTaskDelay(1);
@@ -318,8 +383,9 @@ void CAR::BUTTON::wait() {
 
 CAR::BUTTON CAR::button;
 
+// initialize UART bus at 115200 bit per second and create UART task
 CAR::CAMERA::CAMERA() {
-    uartMutexLock = xSemaphoreCreateMutex();
+    SemaphoreHandle_t uartMutexLock = xSemaphoreCreateMutex();
     uartSetPins(0, SOC_RX0, SOC_TX0, -1, -1);
     xSemaphoreTake(uartMutexLock, portMAX_DELAY);
     int8_t rxPin = uart_get_RxPin(0);
@@ -331,11 +397,13 @@ CAR::CAMERA::CAMERA() {
     xSemaphoreGive(uartMutexLock);
 }
 
-CAR::OBJECT CAR::CAMERA::getObject(uint8_t idx) {
+// returns object at the specified index from the list or an empty object if none exists
+CAR::OBJECT CAR::CAMERA::getObject(uint16_t idx) {
     if(idx >= detections.size()) return {};
     return detections[idx];
 }
 
+// returns true when the Raspberry Pi 5 is ready (has deleted the empty "dummy" object from the beginning)
 bool CAR::CAMERA::ready() {
     if(detections.size() == 1) {
         if(detections[0].c == 0) return false;
@@ -346,8 +414,12 @@ bool CAR::CAMERA::ready() {
 CAR::CAMERA CAR::camera;
 
 CAR::LCD::LCD() {
+
+    // set LCD background LED pin mode
     pinMode(Pin_ST7735_LED, OUTPUT);
     digitalWrite(Pin_ST7735_LED, LOW);
+
+    // enable brightness control using the builtin LEDC controller (usually at maximum brightness = constant HIGH without PWM signal)
     ledc_channel_config_t ledcChannelConfig = {
 		.gpio_num       = Pin_ST7735_LED,
         .speed_mode     = LEDC_LOW_SPEED_MODE,
@@ -366,6 +438,8 @@ CAR::LCD::LCD() {
         .clk_cfg          = LEDC_AUTO_CLK
     };
 	SNIPE(ledc_timer_config(&ledcTimerConfig));
+
+    // init LCD display and print starting message
     st7735.initR(INITR_BLACKTAB);
     st7735.fillScreen(0x0000);
     st7735.setTextWrap(false);
@@ -376,15 +450,19 @@ CAR::LCD::LCD() {
     st7735.print("System");
     st7735.setCursor(4, 60);
     st7735.print("starting");
+
+    // deactivate any WiFi or Bluetooth components (shouldn't be enabled anyways)
     esp_wifi_deinit();
     esp_bt_controller_deinit();
 }
 
+// set LCD brightness by adjusting LEDC duty cycle
 void CAR::LCD::setBrightness(float brightness) {
     SNIPE(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, constrain(brightness, 0.0f, 1.0f) * 0x3FFF));
 	SNIPE(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2));
 }
 
+// clear screen, draw battery icon and show colored voltage
 void CAR::LCD::showBatteryVoltage() {
     st7735.fillScreen(0x0000);
     float voltage = supervision.getVoltage();
@@ -399,6 +477,8 @@ void CAR::LCD::showBatteryVoltage() {
 void CAR::LCD::showDistanceCalibration(uint8_t i) {
     showBatteryVoltage();
     st7735.setTextColor(0xFFFF);
+
+    // show which distance sensor needs to be placed 2m from the border
     st7735.drawLine(i < 2 ? 4 : 11, (i < 2 ? 31 : 24), i < 2 ? 18 : 11, (i < 2 ? 31 : 38), 0xFFFF);
     st7735.drawLine(i % 2 ? 18 : 4, 31, 11, (i % 2 ? 38 : 24), 0xFFFF);
     st7735.drawLine((i < 1 || i > 2) ? 4 : 18, 31, 11, ((i < 1 || i > 2) ? 38 : 24), 0xFFFF);
@@ -410,8 +490,12 @@ void CAR::LCD::showDistanceCalibration(uint8_t i) {
     st7735.print("button");
     st7735.setCursor(4, 90);
     st7735.print("to start");
+
+    // wait for button press
     vTaskDelay(300);
     button.wait();
+
+    // show waiting screen
     showBatteryVoltage();
     st7735.setTextColor(0xFFFF, 0x0000);
     st7735.setCursor(4, 50);
@@ -420,7 +504,11 @@ void CAR::LCD::showDistanceCalibration(uint8_t i) {
     st7735.print("Viewport");
     st7735.setCursor(4, 90);
     st7735.print("Centers ");
+
+    // store viewport center to be restored later
     uint8_t lastVl53l1xViewCenter = vl53l1xViewCenters[i];
+
+    // measure average distances for all possible viewport centers
     int64_t testingResults[11] = {};
     TickType_t lastDelay = xTaskGetTickCount();
     for(uint16_t j = 0; j < 11; j++) {
@@ -434,8 +522,12 @@ void CAR::LCD::showDistanceCalibration(uint8_t i) {
         }
         testingResults[j] /= 4;
     }
+
+    // restore viewport center
     vl53l1xViewCenters[i] = lastVl53l1xViewCenter;
-    st7735.fillRect(3, 24, 110, 100, 0x0000);
+
+    // draw results chart
+    showBatteryVoltage();
     st7735.setTextColor(0xFFFF);
     st7735.setTextSize(1);
     for(uint8_t j = 0; j < 11; j++) {
@@ -451,19 +543,25 @@ void CAR::LCD::showDistanceCalibration(uint8_t i) {
     st7735.setTextSize(2);
 }
 
+// show latest distance measurements of every sensor
 void CAR::LCD::showDistances() {
     showBatteryVoltage();
     st7735.setTextColor(0xFFFF);
     for(uint8_t i = 0; i < 4; i++) {
+
+        // draw arrow to indicate sensor position
         st7735.drawLine(i < 2 ? 4 : 11, (i < 2 ? 31 : 24) + (i * 20), i < 2 ? 18 : 11, (i < 2 ? 31 : 38) + (i * 20), 0xFFFF);
         st7735.drawLine(i % 2 ? 18 : 4, 31 + (i * 20), 11, (i % 2 ? 38 : 24) + (i * 20), 0xFFFF);
         st7735.drawLine((i < 1 || i > 2) ? 4 : 18, 31 + (i * 20), 11, ((i < 1 || i > 2) ? 38 : 24) + (i * 20), 0xFFFF);
+
+        // print measurement
         st7735.setCursor(26, (i * 20) + 24);
         st7735.print(vl53l1x.getDistance(i));
         st7735.print(" mm  ");
     }
 }
 
+// show finish screen including run time and task flow problems if existing
 void CAR::LCD::showFinish(uint32_t duration) {
     duration /= 1000u;
     showBatteryVoltage();
@@ -475,14 +573,16 @@ void CAR::LCD::showFinish(uint32_t duration) {
     st7735.print("Time:");
     st7735.setCursor(4, 90);
     st7735.printf("%02u:%02u:%03u", duration / 60000u, (duration / 1000u) % 60u, duration % 1000u);
-    if(*std::min_element(taskFlowFailures, taskFlowFailures + 4) > 0) {
+    if(*std::min_element(taskFlowFailures, taskFlowFailures + 2) > 0) {
+        st7735.setTextColor(0xF800, 0x0000);
         st7735.setCursor(4, 110);
         st7735.printf("%lu %lu", taskFlowFailures[0], taskFlowFailures[1]);
         st7735.setCursor(4, 130);
-        st7735.printf("%lu %lu", taskFlowFailures[2], taskFlowFailures[3]);
+        st7735.printf("%lu", taskFlowFailures[2]);
     }
 }
 
+// show all detected objects on the screen (like the camera would see them)
 void CAR::LCD::showObjects() {
     std::vector<CAR::OBJECT> objectBuf = detections;
     showBatteryVoltage();
@@ -493,6 +593,7 @@ void CAR::LCD::showObjects() {
     st7735.drawRect(9, 40, 110, 110, 0xFFFF);
 }
 
+// show ready screen including required start time and reset reasons if unusual (should not happen, only for debug)
 void CAR::LCD::showReady(uint32_t duration) {
     duration /= 1000u;
     showBatteryVoltage();
@@ -513,6 +614,7 @@ void CAR::LCD::showReady(uint32_t duration) {
     }
 }
 
+// shows latest rotation data
 void CAR::LCD::showRotation() {
     showBatteryVoltage();
     st7735.setTextColor(0xFFFF, 0x0000);
@@ -525,6 +627,7 @@ void CAR::LCD::showRotation() {
     }
 }
 
+// shows string str (only for debug)
 void CAR::LCD::showString(String str) {
     showBatteryVoltage();
     st7735.setTextColor(0xFFFF);
@@ -532,6 +635,7 @@ void CAR::LCD::showString(String str) {
     st7735.print(str);
 }
 
+// shows total current, motor current and MOSFET temperature
 void CAR::LCD::showSupervision() {
     showBatteryVoltage();
     for(uint8_t i = 0; i < 3; i++) {
@@ -571,6 +675,7 @@ void CAR::LCD::showSupervision() {
 
 CAR::LCD CAR::lcd;
 
+// set brightness for left and right LED groups
 void CAR::LEDS::setBrightness(uint8_t left, uint8_t right) {
     ledState = (_min(left, 15) << 4) | _min(right, 15);
 }
@@ -578,10 +683,14 @@ void CAR::LEDS::setBrightness(uint8_t left, uint8_t right) {
 CAR::LEDS CAR::leds;
 
 CAR::MOTOR::MOTOR() {
+
+    // set motor pin states
     pinMode(Pin_Motor_PWM, OUTPUT);
     pinMode(Pin_Motor_Direction_Invert, OUTPUT);
     digitalWrite(Pin_Motor_PWM, LOW);
     digitalWrite(Pin_Motor_Direction_Invert, LOW);
+
+    // init LEDC controller for motor PWM control
     ledc_channel_config_t ledcChannelConfig = {
 		.gpio_num       = Pin_Motor_PWM,
         .speed_mode     = LEDC_LOW_SPEED_MODE,
@@ -600,18 +709,28 @@ CAR::MOTOR::MOTOR() {
         .clk_cfg          = LEDC_AUTO_CLK
     };
 	SNIPE(ledc_timer_config(&ledcTimerConfig));
-    SNIPE(xTaskCreatePinnedToCore(motor_control_task, "Motor Acceleration", 5000, 0, 2, &motorAccelerationThread, 1 - xPortGetCoreID()));
+
+    // create background task for acceleration control
+    SNIPE(xTaskCreatePinnedToCore(motor_control_task, "acceleration control", 5000, 0, 2, &motorAccelerationThread, 1 - xPortGetCoreID()));
 }
 
+// sets new motor target speed
 void CAR::MOTOR::setSpeed(float speed) {
     motorTargetDuty = constrain(speed, -1.0, 1.0) * (1 << LEDC_TIMER_12_BIT);
 }
 
 CAR::MOTOR CAR::motor;
 
+// starts MPU-9250 gyro sensor and performs fast calibration
 void CAR::MPU9250::init() {
+
+    // set pin mode for interrupt pin
     pinMode(Pin_MPU9250_Data_Ready, INPUT);
+
+    // init I2C bus 0 @ 400 kHz
     Wire.begin(Pin_I2C_0_SDA, Pin_I2C_0_SCL, 400000);
+
+    // init MPU-9250 sensor
     int_param_s int_param = {};
     mpu_init(&int_param);
     mpu_set_bypass(1);
@@ -628,14 +747,19 @@ void CAR::MPU9250::init() {
     dmp_enable_feature(DMP_FEATURE_TAP | DMP_FEATURE_6X_LP_QUAT);
     dmp_set_fifo_rate(60);
     mpu_set_dmp_state(1);
+
+    // create task to receive rotation data
     SNIPE(xTaskCreatePinnedToCore(i2c0_task, "I2C0 Task", 10000, 0, 2, &i2cThread0, 1 - xPortGetCoreID()));
     vTaskDelay(1000);
+
+    // perform simple calibration to avoid some accumulating errors
     FLOAT3 startRotation = getRotation();
     vTaskDelay(4000);
     FLOAT3 endRotation = getRotation();
     for(uint8_t i = 0; i < 3; i++) _rotationOffset[i] = (startRotation.data[i] - endRotation.data[i]) / 4000000;
 }
 
+// requests acceleration measurements
 CAR::MPU9250::FLOAT3 CAR::MPU9250::getAcceleration() {
     int16_t raw[3] = {};
     mpu_get_accel_reg(raw, 0);
@@ -646,6 +770,7 @@ CAR::MPU9250::FLOAT3 CAR::MPU9250::getAcceleration() {
     return result;
 }
 
+// calculates rotation relative to starting position including rounds
 CAR::MPU9250::FLOAT3 CAR::MPU9250::getRotation() {
     int64_t time = esp_timer_get_time();
     return {
@@ -655,6 +780,7 @@ CAR::MPU9250::FLOAT3 CAR::MPU9250::getRotation() {
     };
 }
 
+// request rotation change measurement
 CAR::MPU9250::FLOAT3 CAR::MPU9250::getRotationChange() {
     int16_t raw[3] = {};
     mpu_get_gyro_reg(raw, 0);
@@ -668,8 +794,12 @@ CAR::MPU9250::FLOAT3 CAR::MPU9250::getRotationChange() {
 CAR::MPU9250 CAR::mpu9250;
 
 CAR::SERVO::SERVO() {
+
+    // set servo pin mode
     pinMode(Pin_Servo_PWM, OUTPUT);
     digitalWrite(Pin_Servo_PWM, LOW);
+
+    // init LEDC channel for servo control
     ledc_channel_config_t ledcChannelConfig = {
 		.gpio_num       = Pin_Servo_PWM,
         .speed_mode     = LEDC_LOW_SPEED_MODE,
@@ -690,6 +820,7 @@ CAR::SERVO::SERVO() {
 	SNIPE(ledc_timer_config(&ledcTimerConfig));
 }
 
+// set new servo angle by adjusting PWM duty
 void CAR::SERVO::setAngle(float angle) {
     SNIPE(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, Servo_PWM_0_Duty + (constrain(angle, -Servo_PWM_Max_Angle, Servo_PWM_Max_Angle) * 70)));
 	SNIPE(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
@@ -698,12 +829,17 @@ void CAR::SERVO::setAngle(float angle) {
 CAR::SERVO CAR::servo;
 
 CAR::VCT_SUPERVISION::VCT_SUPERVISION() {
+
+    // set pin modes for sensor input pins
     pinMode(Pin_Battery_Voltage, INPUT);
     pinMode(Pin_Total_Current, INPUT);
     pinMode(Pin_Motor_Current, INPUT);
+
+    // seach temperature sensor address
 	oneWire.search(ds18b20Address);
 }
 
+// request MOSFET temperature from DS18B20 sensor
 float CAR::VCT_SUPERVISION::getMosfetTemp() {
 	oneWire.reset();
 	oneWire.select(ds18b20Address);
@@ -719,16 +855,19 @@ float CAR::VCT_SUPERVISION::getMosfetTemp() {
     return ((((int16_t)buf[1]) << 11) | (((int16_t)buf[0]) << 3) | (0xFFF80000 * (buf[1] & 0x80))) * 0.0078125f;
 }
 
+// calculate motor current
 float CAR::VCT_SUPERVISION::getMotorCurrent() {
     float result = analogReadMilliVolts(Pin_Motor_Current) * 0.001f;
     return result <= 0.15f ? 0.0f : result;
 }
 
+// calculate total current
 float CAR::VCT_SUPERVISION::getTotalCurrent() {
     float result = analogReadMilliVolts(Pin_Total_Current) * 0.002f;
     return result <= 0.3f ? 0.0f : result;
 }
 
+// calculate battery voltage
 float CAR::VCT_SUPERVISION::getVoltage() {
     return analogReadMilliVolts(Pin_Battery_Voltage) * 0.0031273f;
 }
@@ -736,12 +875,18 @@ float CAR::VCT_SUPERVISION::getVoltage() {
 CAR::VCT_SUPERVISION CAR::supervision;
 
 void CAR::VL53L1X::init() {
+
+    // start I2C bus 1
     Wire1.begin(Pin_I2C_1_SDA, Pin_I2C_1_SCL, 400000);
+
+    // deactivate all distance sensors
     for(uint8_t i = 0; i < 4; i++) {
         pinMode(Pins_VL53L1X_Shutdown[i], OUTPUT);
         digitalWrite(Pins_VL53L1X_Shutdown[i], LOW);
     }
     delay(15);
+
+    // wake up one sensor, assign a new address and configure it, then wake up the next one
     for(uint8_t i = 0; i < 4; i++) {
         digitalWrite(Pins_VL53L1X_Shutdown[i], HIGH);
         delay(15);
@@ -765,13 +910,15 @@ void CAR::VL53L1X::init() {
 		vl53l1xWriteWord(0x30 + i, 0x0061, 0x01E8);
         vl53l1xWriteDWord(0x30 + i, 0x006C, (uint32_t)((vl53l1xReadWord(0x30 + i, 0x00DE) & 0x03FF) * 64.5f));
         vl53l1xWriteByte(0x30 + i, 0x007F, vl53l1xViewCenters[i]);
-	    vl53l1xWriteByte(0x30 + i, 0x0080, 0x55); // ((Y - 1) << 4) | (X - 1)
-        lastVl53l1xViewCenters[i] = vl53l1xViewCenters[i];
+	    vl53l1xWriteByte(0x30 + i, 0x0080, 0x55);
         delay(15);
     }
+
+    // create background task to read sensor measurements
     SNIPE(xTaskCreatePinnedToCore(i2c1_task, "I2C1 Task", 10000, 0, 2, &i2cThread1, 1 - xPortGetCoreID()));
 }
 
+// returns latest distance measurement
 uint16_t CAR::VL53L1X::getDistance(uint8_t pos) {
     return distances[pos];
 }
